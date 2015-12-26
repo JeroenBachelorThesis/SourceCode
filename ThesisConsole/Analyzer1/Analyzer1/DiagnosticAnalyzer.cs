@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -13,38 +14,101 @@ namespace Analyzer1
     [DiagnosticAnalyzer(LanguageNames.CSharp)]
     public class Analyzer1Analyzer : DiagnosticAnalyzer
     {
-        public const string DiagnosticId = "Analyzer1";
+        private const DiagnosticSeverity Severity = DiagnosticSeverity.Warning;
+        private static readonly string Category = "strings";
+        private static readonly string Message = "some message";
+        private static readonly string Title = "some title";
 
-        // You can change these strings in the Resources.resx file. If you do not want your analyzer to be localize-able, you can use regular strings for Title and MessageFormat.
-        // See https://github.com/dotnet/roslyn/blob/master/docs/analyzers/Localizing%20Analyzers.md for more on localization
-        private static readonly LocalizableString Title = new LocalizableResourceString(nameof(Resources.AnalyzerTitle), Resources.ResourceManager, typeof(Resources));
-        private static readonly LocalizableString MessageFormat = new LocalizableResourceString(nameof(Resources.AnalyzerMessageFormat), Resources.ResourceManager, typeof(Resources));
-        private static readonly LocalizableString Description = new LocalizableResourceString(nameof(Resources.AnalyzerDescription), Resources.ResourceManager, typeof(Resources));
-        private const string Category = "Naming";
+        internal static DiagnosticDescriptor Rule =>
+                new DiagnosticDescriptor("testID", Title, Message, Category, Severity, true);
 
-        private static DiagnosticDescriptor Rule = new DiagnosticDescriptor(DiagnosticId, Title, MessageFormat, Category, DiagnosticSeverity.Warning, isEnabledByDefault: true, description: Description);
-
-        public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics { get { return ImmutableArray.Create(Rule); } }
+        public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics => ImmutableArray.Create(Rule);
 
         public override void Initialize(AnalysisContext context)
         {
-            // TODO: Consider registering other actions that act on syntax instead of or in addition to symbols
-            // See https://github.com/dotnet/roslyn/blob/master/docs/analyzers/Analyzer%20Actions%20Semantics.md for more information
-            context.RegisterSymbolAction(AnalyzeSymbol, SymbolKind.NamedType);
+            context.RegisterSyntaxNodeAction(AnalyzeNode, SyntaxKind.InvocationExpression);
         }
 
-        private static void AnalyzeSymbol(SymbolAnalysisContext context)
+        private void AnalyzeNode(SyntaxNodeAnalysisContext context)
         {
-            // TODO: Replace the following code with your own analysis, generating Diagnostic objects for any issues you find
-            var namedTypeSymbol = (INamedTypeSymbol)context.Symbol;
-
-            // Find just those named type symbols with names containing lowercase letters.
-            if (namedTypeSymbol.Name.ToCharArray().Any(char.IsLower))
+            var invocation = context.Node as InvocationExpressionSyntax;
+            if (invocation == null)
             {
-                // For all such symbols, produce a diagnostic.
-                var diagnostic = Diagnostic.Create(Rule, namedTypeSymbol.Locations[0], namedTypeSymbol.Name);
+                return;
+            }
 
-                context.ReportDiagnostic(diagnostic);
+            // Verify we're dealing with a string.Format() call
+            if (!invocation.IsAnInvocationOf(typeof(string), nameof(string.Format), context.SemanticModel))
+            {
+                return;
+            }
+
+            if (invocation.ArgumentList == null)
+            {
+                return;
+            }
+
+            // Verify the format is a literal expression and not a method invocation or an identifier
+            // The overloads are in the form string.Format(string, object[]) or string.Format(CultureInfo, string, object[])
+            var allArguments = invocation.ArgumentList.Arguments;
+            var firstArgument = allArguments.ElementAtOrDefault(0, null);
+            var secondArgument = allArguments.ElementAtOrDefault(1, null);
+            if (firstArgument == null)
+            {
+                return;
+            }
+
+            var firstArgumentIsLiteral = firstArgument.Expression is LiteralExpressionSyntax;
+            var secondArgumentIsLiteral = secondArgument?.Expression is LiteralExpressionSyntax;
+            if (!firstArgumentIsLiteral && !secondArgumentIsLiteral)
+            {
+                return;
+            }
+
+            // We ignore interpolated strings for now (workitem tracked in https://github.com/Vannevelj/VSDiagnostics/issues/313)
+            if (firstArgument.Expression is InterpolatedStringExpressionSyntax)
+            {
+                return;
+            }
+
+            // If we got here, it means that the either the first or the second argument is a literal. 
+            // If the first is a literal then that is our format
+            var formatString = firstArgumentIsLiteral
+                ? ((LiteralExpressionSyntax)firstArgument.Expression).GetText().ToString()
+                : ((LiteralExpressionSyntax)secondArgument.Expression).GetText().ToString();
+
+            // Get the total amount of arguments passed in for the format
+            // If the first one is the literal (aka: the format specified) then every other argument is an argument to the format
+            // If not, it means the first one is the CultureInfo, the second is the format and all others are format arguments
+            int amountOfArguments;
+            if (firstArgumentIsLiteral)
+            {
+                amountOfArguments = allArguments.Count - 1;
+            }
+            else
+            {
+                amountOfArguments = allArguments.Count - 2;
+            }
+
+            // Get the placeholders we use, stripped off their format specifier, get the highest value 
+            // and verify that this value + 1 (to account for 0-based indexing) is not greater than the amount of placeholder arguments
+            var placeholders = PlaceholderHelpers.GetPlaceholders(formatString)
+                                                 .Cast<Match>()
+                                                 .Select(x => x.Value)
+                                                 .Select(PlaceholderHelpers.GetPlaceholderIndex)
+                                                 .Select(int.Parse)
+                                                 .ToList();
+
+            if (!placeholders.Any())
+            {
+                return;
+            }
+
+            var highestPlaceholder = placeholders.Max();
+            if (highestPlaceholder + 1 > amountOfArguments)
+            {
+                context.ReportDiagnostic(Diagnostic.Create(Rule, firstArgumentIsLiteral ? firstArgument.GetLocation() :
+                                                                                          secondArgument.GetLocation()));
             }
         }
     }
